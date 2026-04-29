@@ -1,0 +1,6 @@
+name: astrbot_plugin_jmcomic
+display_name: JMComic下载器
+desc: JMComic下载插件，支持图片和PDF两种发送方式
+help: 使用 /jm <作品ID> 下载JMComic作品，可在配置中选择发送方式（图片/PDF）
+version: v1.1.0
+author: Baizi

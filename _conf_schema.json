@@ -1,0 +1,12 @@
+{
+    "send_mode": {
+        "description": "发送方式",
+        "hint": "选择下载内容的发送方式。图片模式将以合并转发消息形式发送图片，PDF模式将把所有图片合并为PDF文件发送（PDF密码自动设置为作品ID）",
+        "type": "string",
+        "options": [
+            "image(图片模式)",
+            "pdf(PDF模式)"
+        ],
+        "default": "image(图片模式)"
+    }
+}
