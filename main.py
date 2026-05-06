@@ -149,8 +149,8 @@ class JMComicDownloader(Star):
                 else:
                     shutil.move(str(temp_pdf_path), str(final_pdf_path))
                 
-                from astrbot.api.message_components import File
                 file_name = f"{jm_id}.pdf"
+                file_path_str = str(final_pdf_path)
                 
                 callback_base = astrbot_config.get("callback_api_base", "")
                 if callback_base:
@@ -159,33 +159,45 @@ class JMComicDownloader(Star):
                     file_url = f"{callback_base}/api/file/{token}"
                     seg = File(name=file_name, file=file_url)
                     logger.info(f"使用文件服务发送PDF: {file_url}")
+                    yield event.chain_result([seg])
                 else:
-                    logger.warning("callback_api_base 未配置，将使用本地路径发送文件。"
-                                   "如果 AstrBot 与消息平台不在同一台机器上，请配置 callback_api_base。")
-                    seg = File(name=file_name, file=str(final_pdf_path))
-                
-                yield event.chain_result([seg])
-                
-                file_size_mb = final_pdf_path.stat().st_size / (1024 * 1024)
-                wait_time = max(5, int(file_size_mb * 2))
-                logger.info(f"PDF大小: {file_size_mb:.2f}MB，等待{wait_time}秒后清理文件")
-                await asyncio.sleep(wait_time)
+                    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+                    if isinstance(event, AiocqhttpMessageEvent):
+                        bot = event.bot
+                        if event.is_private_chat():
+                            await bot.api.call_action(
+                                "upload_private_file",
+                                user_id=int(event.get_sender_id()),
+                                file=file_path_str,
+                                name=file_name
+                            )
+                        else:
+                            await bot.api.call_action(
+                                "upload_group_file",
+                                group_id=int(event.get_group_id()),
+                                file=file_path_str,
+                                name=file_name
+                            )
+                        yield event.plain_result(f"PDF文件 {file_name} 已上传")
+                    else:
+                        from astrbot.api.message_components import File
+                        seg = File(name=file_name, file=file_path_str)
+                        yield event.chain_result([seg])
                 
             finally:
-                try:
-                    if final_pdf_path.exists():
-                        os.remove(final_pdf_path)
-                        logger.info(f"已删除PDF文件: {final_pdf_path}")
-                    if temp_pdf_path.exists():
-                        os.remove(temp_pdf_path)
-                except Exception as e:
-                    logger.error(f"删除PDF文件失败: {str(e)}")
+                async def delayed_cleanup():
+                    try:
+                        await asyncio.sleep(60)
+                        if final_pdf_path.exists():
+                            os.remove(final_pdf_path)
+                        if temp_pdf_path.exists():
+                            os.remove(temp_pdf_path)
+                        shutil.rmtree(base_path)
+                        logger.info(f"已清理PDF文件: {base_path}")
+                    except Exception as e:
+                        logger.error(f"清理PDF文件失败: {str(e)}")
                 
-                try:
-                    shutil.rmtree(base_path)
-                    logger.info(f"已删除下载文件夹: {base_path}")
-                except Exception as e:
-                    logger.error(f"删除文件夹失败: {str(e)}")
+                asyncio.create_task(delayed_cleanup())
                 
         except Exception as e:
             yield event.plain_result(f"发送PDF时出错: {str(e)}")
