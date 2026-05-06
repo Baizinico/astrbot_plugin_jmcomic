@@ -148,9 +148,13 @@ class JMComicDownloader(Star):
                 else:
                     shutil.move(str(temp_pdf_path), str(final_pdf_path))
                 
+                import base64
+                with open(final_pdf_path, "rb") as f:
+                    pdf_base64 = base64.b64encode(f.read()).decode("utf-8")
+                
                 from astrbot.api.message_components import File
                 file_name = f"{jm_id}.pdf"
-                seg = File(name=file_name, file=str(final_pdf_path))
+                seg = File(name=file_name, file=f"base64://{pdf_base64}")
                 yield event.chain_result([seg])
                 
                 file_size_mb = final_pdf_path.stat().st_size / (1024 * 1024)
