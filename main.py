@@ -115,6 +115,7 @@ class JMComicDownloader(Star):
 
     async def send_pdf(self, event: AstrMessageEvent, jm_id: str):
         try:
+            from astrbot.api.message_components import File
             base_path = Path(get_astrbot_data_path()) / 'Download' / jm_id
             
             if not base_path.exists():
