@@ -1,6 +1,7 @@
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
+from astrbot.core import astrbot_config, file_token_service
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 import jmcomic
@@ -150,7 +151,19 @@ class JMComicDownloader(Star):
                 
                 from astrbot.api.message_components import File
                 file_name = f"{jm_id}.pdf"
-                seg = File(name=file_name, file=str(final_pdf_path))
+                
+                callback_base = astrbot_config.get("callback_api_base", "")
+                if callback_base:
+                    callback_base = str(callback_base).removesuffix("/")
+                    token = await file_token_service.register_file(str(final_pdf_path))
+                    file_url = f"{callback_base}/api/file/{token}"
+                    seg = File(name=file_name, file=file_url)
+                    logger.info(f"使用文件服务发送PDF: {file_url}")
+                else:
+                    logger.warning("callback_api_base 未配置，将使用本地路径发送文件。"
+                                   "如果 AstrBot 与消息平台不在同一台机器上，请配置 callback_api_base。")
+                    seg = File(name=file_name, file=str(final_pdf_path))
+                
                 yield event.chain_result([seg])
                 
                 file_size_mb = final_pdf_path.stat().st_size / (1024 * 1024)
