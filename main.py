@@ -1,7 +1,6 @@
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.core import astrbot_config, file_token_service
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 import jmcomic
@@ -153,14 +152,24 @@ class JMComicDownloader(Star):
                 file_name = f"{jm_id}.pdf"
                 file_path_str = str(final_pdf_path)
                 
-                callback_base = astrbot_config.get("callback_api_base", "")
-                if callback_base:
-                    callback_base = str(callback_base).removesuffix("/")
-                    token = await file_token_service.register_file(str(final_pdf_path))
-                    file_url = f"{callback_base}/api/file/{token}"
-                    seg = File(name=file_name, file=file_url)
-                    logger.info(f"使用文件服务发送PDF: {file_url}")
-                    yield event.chain_result([seg])
+                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+                if isinstance(event, AiocqhttpMessageEvent):
+                    bot = event.bot
+                    if event.is_private_chat():
+                        await bot.api.call_action(
+                            "upload_private_file",
+                            user_id=int(event.get_sender_id()),
+                            file=file_path_str,
+                            name=file_name
+                        )
+                    else:
+                        await bot.api.call_action(
+                            "upload_group_file",
+                            group_id=int(event.get_group_id()),
+                            file=file_path_str,
+                            name=file_name
+                        )
+                    yield event.plain_result(f"PDF文件 {file_name} 已上传")
                 else:
                     seg = File(name=file_name, file=file_path_str)
                     yield event.chain_result([seg])
