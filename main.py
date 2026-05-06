@@ -161,28 +161,8 @@ class JMComicDownloader(Star):
                     logger.info(f"使用文件服务发送PDF: {file_url}")
                     yield event.chain_result([seg])
                 else:
-                    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-                    if isinstance(event, AiocqhttpMessageEvent):
-                        bot = event.bot
-                        if event.is_private_chat():
-                            await bot.api.call_action(
-                                "upload_private_file",
-                                user_id=int(event.get_sender_id()),
-                                file=file_path_str,
-                                name=file_name
-                            )
-                        else:
-                            await bot.api.call_action(
-                                "upload_group_file",
-                                group_id=int(event.get_group_id()),
-                                file=file_path_str,
-                                name=file_name
-                            )
-                        yield event.plain_result(f"PDF文件 {file_name} 已上传")
-                    else:
-                        from astrbot.api.message_components import File
-                        seg = File(name=file_name, file=file_path_str)
-                        yield event.chain_result([seg])
+                    seg = File(name=file_name, file=file_path_str)
+                    yield event.chain_result([seg])
                 
             finally:
                 async def delayed_cleanup():
