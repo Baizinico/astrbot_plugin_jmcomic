@@ -1,0 +1,26 @@
+client:
+  cache: null
+  domain: []
+  impl: api
+  postman:
+    meta_data:
+      headers: null
+      impersonate: chrome110
+      proxies: null
+    type: cffi
+  retry_times: 0
+dir_rule:
+  base_dir: ''
+  rule: Bd_Aid
+download:
+  cache: true
+  image:
+    decode: true
+    suffix: .png
+  threading:
+    image: 16
+    photo: 8
+log: true
+plugins:
+  valid: log
+version: '2.1'
