@@ -2,7 +2,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.core.config.astrbot_config import AstrBotConfig
-import pathlib
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 import jmcomic
 import asyncio
 import os
@@ -15,6 +15,10 @@ from PIL import Image
 plugin_dir = Path(__file__).parent
 config_file_path = plugin_dir / 'option.yml'
 option = jmcomic.create_option_by_file(str(config_file_path))
+
+# Set download directory to an absolute path for cross-platform compatibility
+download_dir = Path(get_astrbot_data_path()) / 'Download'
+option.dir_rule.base_dir = str(download_dir)
 
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
@@ -66,62 +70,51 @@ class JMComicDownloader(Star):
     
     async def send_images(self, event: AstrMessageEvent, jm_id: str):
         try:
-            base_path = pathlib.Path('/AstrBot/data/Download') / jm_id
-            
+            base_path = Path(get_astrbot_data_path()) / 'Download' / jm_id
+
             if not base_path.exists():
                 yield event.plain_result(f"本子不存在或者下载失败力")
                 return
-            
+
             image_paths = sorted([
-                str(base_path / f) for f in os.listdir(base_path) 
+                str(base_path / f) for f in os.listdir(base_path)
                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))
             ])
-            
+
             if not image_paths:
                 yield event.plain_result("下载失败力")
                 return
-            
-            from astrbot.api.message_components import Node, Plain, Image
-            
-            nodes = []
-            batch_size = 10
-            
+
+            from astrbot.api.message_components import Image
+
+            batch_size = 5
+
             for i in range(0, len(image_paths), batch_size):
                 batch = image_paths[i:i + batch_size]
-                content = []
-                
+                chain = []
+
                 for path in batch:
                     try:
-                        content.append(Image.fromFileSystem(path))
+                        chain.append(Image.fromFileSystem(path))
                     except Exception as e:
                         logger.error(f"添加图片失败: {path} - {str(e)}")
-                        content.append(Plain(f"[图片加载失败: {os.path.basename(path)}]"))
-                
-                image_node = Node(
-                    uin=725699515,
-                    name="爱你喵",
-                    content=content
-                )
-                nodes.append(image_node)
 
-            try:
-                yield event.chain_result(nodes)
-            except Exception as e:
-                logger.error(f"发送图片消息失败: {str(e)}")
-                yield event.plain_result(f"发送图片失败，可能是由于消息过长或网络问题: {str(e)}")
+                if chain:
+                    yield event.chain_result(chain)
+                    await asyncio.sleep(0.5)
 
             try:
                 shutil.rmtree(base_path)
                 logger.info(f"已删除下载文件: {base_path}")
             except Exception as e:
                 logger.error(f"删除文件失败: {str(e)}")
-                
+
         except Exception as e:
             yield event.plain_result(f"发送图片时出错: {str(e)}")
 
     async def send_pdf(self, event: AstrMessageEvent, jm_id: str):
         try:
-            base_path = pathlib.Path('/AstrBot/data/Download') / jm_id
+            base_path = Path(get_astrbot_data_path()) / 'Download' / jm_id
             
             if not base_path.exists():
                 yield event.plain_result(f"本子不存在或者下载失败力")

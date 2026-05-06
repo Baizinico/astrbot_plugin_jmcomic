@@ -10,8 +10,8 @@ client:
     type: cffi
   retry_times: 0
 dir_rule:
-  base_dir: ''
-  rule: Bd_Aid
+  base_dir: data/Download
+  rule: Aid
 download:
   cache: true
   image:
