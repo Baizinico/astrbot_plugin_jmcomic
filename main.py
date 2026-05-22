@@ -6,8 +6,6 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 import jmcomic
 import asyncio
 import os
-import ssl
-import certifi
 import shutil
 from pathlib import Path
 from PIL import Image
@@ -16,11 +14,8 @@ plugin_dir = Path(__file__).parent
 config_file_path = plugin_dir / 'option.yml'
 option = jmcomic.create_option_by_file(str(config_file_path))
 
-# Set download directory to an absolute path for cross-platform compatibility
 download_dir = Path(get_astrbot_data_path()) / 'Download'
 option.dir_rule.base_dir = str(download_dir)
-
-ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 
 @register("JMComic下载器", "Baizi", "JMComic下载插件", "1.0.0")
@@ -28,11 +23,17 @@ class JMComicDownloader(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-    
+        self._cleanup_tasks: set[asyncio.Task] = set()
+
     async def initialize(self):
         logger.info("JMComic下载插件已加载")
-    
+
     async def terminate(self):
+        for task in self._cleanup_tasks:
+            task.cancel()
+        if self._cleanup_tasks:
+            await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
+            self._cleanup_tasks.clear()
         logger.info("JMComic下载插件已卸载")
     
     async def process_jm_download(self, event: AstrMessageEvent, jm_id: str):
@@ -186,8 +187,10 @@ class JMComicDownloader(Star):
                         logger.info(f"已清理PDF文件: {base_path}")
                     except Exception as e:
                         logger.error(f"清理PDF文件失败: {str(e)}")
-                
-                asyncio.create_task(delayed_cleanup())
+
+                task = asyncio.create_task(delayed_cleanup())
+                self._cleanup_tasks.add(task)
+                task.add_done_callback(self._cleanup_tasks.discard)
                 
         except Exception as e:
             yield event.plain_result(f"发送PDF时出错: {str(e)}")
@@ -195,58 +198,82 @@ class JMComicDownloader(Star):
     def _create_pdf_from_images(self, image_paths: list, output_path: str):
         images = []
         first_image = None
-        
+
         for i, path in enumerate(image_paths):
+            img = None
             try:
                 img = Image.open(path)
                 img.verify()
+                img.close()
+
                 img = Image.open(path)
-                
+
                 if img.mode == 'RGBA':
                     img = img.convert('RGB')
                 elif img.mode != 'RGB':
                     img = img.convert('RGB')
-                
+
                 if i == 0:
                     first_image = img
                 else:
                     images.append(img)
-                    
+
                 logger.debug(f"成功处理图片: {path}")
-                    
+
             except Exception as e:
+                if img is not None:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
                 logger.error(f"处理图片失败: {path} - {str(e)}")
                 continue
-        
-        if first_image:
-            first_image.save(
-                output_path, 
-                "PDF", 
-                resolution=100.0,
-                save_all=True, 
-                append_images=images
-            )
-            logger.info(f"PDF创建成功: {output_path}, 共 {len(images) + 1} 页")
-        else:
-            raise ValueError("没有有效的图片可以生成PDF")
+
+        try:
+            if first_image:
+                first_image.save(
+                    output_path,
+                    "PDF",
+                    resolution=100.0,
+                    save_all=True,
+                    append_images=images
+                )
+                logger.info(f"PDF创建成功: {output_path}, 共 {len(images) + 1} 页")
+            else:
+                raise ValueError("没有有效的图片可以生成PDF")
+        finally:
+            if first_image is not None:
+                try:
+                    first_image.close()
+                except Exception:
+                    pass
+            for img in images:
+                try:
+                    img.close()
+                except Exception:
+                    pass
 
     def _add_password_to_pdf(self, input_path: str, output_path: str, password: str):
         try:
             from pypdf import PdfReader, PdfWriter
-            
+
             reader = PdfReader(input_path)
             writer = PdfWriter()
-            
-            for page in reader.pages:
-                writer.add_page(page)
-            
-            writer.encrypt(password)
-            
-            with open(output_path, "wb") as output_file:
-                writer.write(output_file)
-            
-            logger.info(f"PDF加密成功: {output_path}")
-            
+
+            try:
+                for page in reader.pages:
+                    writer.add_page(page)
+
+                writer.encrypt(password)
+
+                with open(output_path, "wb") as output_file:
+                    writer.write(output_file)
+
+                logger.info(f"PDF加密成功: {output_path}")
+            finally:
+                reader.close()
+                writer.close()
+
         except ImportError:
             logger.warning("pypdf库未安装，跳过PDF加密，直接复制文件")
             shutil.copy(input_path, output_path)
