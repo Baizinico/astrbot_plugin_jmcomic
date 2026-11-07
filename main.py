@@ -162,9 +162,19 @@ class JMComicDownloader(Star):
                 pass
 
         class ProgressDownloader(jmcomic.JmDownloader):
+            def do_filter(self, detail):
+                # 多章作品仅下载第一章
+                if detail.is_album():
+                    return detail[0:1]
+                return super().do_filter(detail)
+
             def before_album(self, album):
                 super().before_album(album)
-                emit(f"正在下载《{album.name}》，共 {len(album)} 章")
+                total = len(album)
+                if total > 1:
+                    emit(f"正在下载《{album.name}》，共 {total} 章，仅下载第 1 章")
+                else:
+                    emit(f"正在下载《{album.name}》，共 {total} 章")
 
             def after_photo(self, photo):
                 super().after_photo(photo)
