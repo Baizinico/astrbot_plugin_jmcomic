@@ -8,18 +8,18 @@ client:
       impersonate: chrome110
       proxies: null
     type: cffi
-  retry_times: 0
+  retry_times: 3
 dir_rule:
   base_dir: data/Download
-  rule: Aid
+  rule: Bd_Aid_Pindex
 download:
   cache: true
   image:
     decode: true
     suffix: .png
   threading:
-    image: 16
-    photo: 8
+    image: 8
+    photo: 4
 log: true
 plugins:
   valid: log

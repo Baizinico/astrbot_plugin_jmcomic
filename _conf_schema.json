@@ -1,12 +1,60 @@
 {
     "send_mode": {
         "description": "发送方式",
-        "hint": "选择下载内容的发送方式。图片模式将以合并转发消息形式发送图片，PDF模式将把所有图片合并为PDF文件发送（PDF密码自动设置为作品ID）",
+        "hint": "image：分批发送图片；pdf：把所有图片合并为 PDF 后发送。",
         "type": "string",
         "options": [
-            "image(图片模式)",
-            "pdf(PDF模式)"
+            "image",
+            "pdf"
         ],
-        "default": "image(图片模式)"
+        "default": "image"
+    },
+    "max_images": {
+        "description": "单次最多发送图片数",
+        "hint": "超出数量的图片不会发送，0 表示不限制。增加该值会显著增加流量和耗时。",
+        "type": "int",
+        "default": 80
+    },
+    "batch_size": {
+        "description": "图片分批大小",
+        "hint": "图片模式下每条消息包含的图片数量。",
+        "type": "int",
+        "default": 5
+    },
+    "send_interval": {
+        "description": "分批发送间隔（秒）",
+        "hint": "图片模式下每批消息之间的等待时间，避免发送过快被限流。",
+        "type": "float",
+        "default": 0.5
+    },
+    "use_forward": {
+        "description": "使用合并转发发送图片",
+        "hint": "开启后图片会打包成一条合并转发消息发送，需要协议端支持。默认关闭。",
+        "type": "bool",
+        "default": false
+    },
+    "pdf_encrypt": {
+        "description": "PDF 加密",
+        "hint": "是否给 PDF 添加密码。关闭后发送的 PDF 不加密。",
+        "type": "bool",
+        "default": true
+    },
+    "pdf_password": {
+        "description": "PDF 密码",
+        "hint": "留空时使用作品 ID 作为密码。仅在开启 PDF 加密时生效。",
+        "type": "string",
+        "default": ""
+    },
+    "cleanup_delay": {
+        "description": "文件清理延迟（秒）",
+        "hint": "PDF 发送完成后等待多久删除本地文件。",
+        "type": "int",
+        "default": 60
+    },
+    "only_admin": {
+        "description": "仅管理员可用",
+        "hint": "开启后只有 AstrBot 管理员（admins_id）可以使用 /jm 命令。",
+        "type": "bool",
+        "default": false
     }
 }

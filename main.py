@@ -1,32 +1,59 @@
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
-from astrbot.core.config.astrbot_config import AstrBotConfig
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-import jmcomic
 import asyncio
-import os
+import contextlib
+import re
 import shutil
+import tempfile
+import weakref
 from pathlib import Path
-from PIL import Image
+
+import jmcomic
+from PIL import Image as PILImage
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File, Image, Node, Nodes
+from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.core.config.astrbot_config import AstrBotConfig
+
+PLUGIN_NAME = "astrbot_plugin_jmcomic"
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+PDF_CHUNK_SIZE = 30
 
 plugin_dir = Path(__file__).parent
-config_file_path = plugin_dir / 'option.yml'
-option = jmcomic.create_option_by_file(str(config_file_path))
-
-download_dir = Path(get_astrbot_data_path()) / 'Download'
-option.dir_rule.base_dir = str(download_dir)
+option = jmcomic.create_option_by_file(str(plugin_dir / "option.yml"))
+download_root = StarTools.get_data_dir(PLUGIN_NAME) / "Download"
+option.dir_rule.base_dir = str(download_root)
 
 
-@register("JMComic下载器", "Baizi", "JMComic下载插件", "1.0.0")
+def _natural_key(path: Path, root: Path):
+    parts = re.split(r"(\d+)", path.relative_to(root).as_posix())
+    return [
+        (0, int(part)) if part.isdigit() else (1, part.lower())
+        for part in parts
+        if part
+    ]
+
+
+def _normalize_album_id(raw: str) -> str | None:
+    try:
+        album_id = str(jmcomic.JmcomicText.parse_to_jm_id((raw or "").strip()))
+    except Exception:
+        return None
+    return album_id if album_id.isdigit() else None
+
+
+@register("JMComic下载器", "Baizi", "JMComic下载插件", "1.2.0")
 class JMComicDownloader(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._cleanup_tasks: set[asyncio.Task] = set()
+        self._album_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
 
     async def initialize(self):
-        logger.info("JMComic下载插件已加载")
+        logger.info(f"JMComic下载插件已加载，下载目录: {download_root}")
 
     async def terminate(self):
         for task in self._cleanup_tasks:
@@ -35,248 +62,398 @@ class JMComicDownloader(Star):
             await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
             self._cleanup_tasks.clear()
         logger.info("JMComic下载插件已卸载")
-    
-    async def process_jm_download(self, event: AstrMessageEvent, jm_id: str):
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        value = self.config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _cfg_int(self, key: str, default: int, minimum: int = 0) -> int:
         try:
-            yield event.plain_result(f"开始下载JM作品 {jm_id}，请稍候...")
-            
-            await asyncio.get_event_loop().run_in_executor(
-                None, 
-                lambda: option.download_album({jm_id})
-            )
-            
-            send_mode = self.config.get("send_mode", "image")
-            
-            if "pdf" in send_mode.lower():
-                async for result in self.send_pdf(event, jm_id):
-                    yield result
-            else:
-                async for result in self.send_images(event, jm_id):
-                    yield result
-                
-        except Exception as e:
-            yield event.plain_result(f"处理命令时出错: {str(e)}")
-    
-    @filter.command("jm","JM")
+            return max(minimum, int(self.config.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_float(self, key: str, default: float, minimum: float = 0.0) -> float:
+        try:
+            return max(minimum, float(self.config.get(key, default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _is_pdf_mode(self) -> bool:
+        return "pdf" in str(self.config.get("send_mode", "image")).lower()
+
+    def _pdf_password(self, album_id: str) -> str | None:
+        if not self._cfg_bool("pdf_encrypt", True):
+            return None
+        password = str(self.config.get("pdf_password", "") or "").strip()
+        return password or album_id
+
+    def _get_album_lock(self, album_id: str) -> asyncio.Lock:
+        lock = self._album_locks.get(album_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._album_locks[album_id] = lock
+        return lock
+
+    @filter.command("jm", "JM")
     async def handle_jm_command(self, event: AstrMessageEvent):
         """下载并发送JMComic作品"""
-        parts = event.message_str.split(maxsplit=1)
-        if len(parts) < 2:
-            yield event.plain_result("请提供JM作品ID，例如：/jm 12345")
+        if self._cfg_bool("only_admin", False) and not event.is_admin():
+            yield event.plain_result("只有管理员可以使用该命令。")
             return
 
-        jm_id = parts[1].strip()
-        async for result in self.process_jm_download(event, jm_id):
+        parts = event.message_str.split()
+        if len(parts) < 2:
+            yield event.plain_result("请提供JM作品ID或链接，例如：/jm 12345")
+            return
+
+        album_id = _normalize_album_id(parts[1])
+        if album_id is None:
+            yield event.plain_result("作品 ID 不合法，请提供数字 ID、JM+数字 或作品链接。")
+            return
+
+        async for result in self.process_jm_download(event, album_id):
             yield result
-    
-    async def send_images(self, event: AstrMessageEvent, jm_id: str):
-        try:
-            base_path = Path(get_astrbot_data_path()) / 'Download' / jm_id
 
-            if not base_path.exists():
-                yield event.plain_result(f"本子不存在或者下载失败力")
-                return
-
-            image_paths = sorted([
-                str(base_path / f) for f in os.listdir(base_path)
-                if f.lower().endswith(('.png', '.jpg', '.jpeg'))
-            ])
-
-            if not image_paths:
-                yield event.plain_result("下载失败力")
-                return
-
-            from astrbot.api.message_components import Image
-
-            batch_size = 5
-
-            for i in range(0, len(image_paths), batch_size):
-                batch = image_paths[i:i + batch_size]
-                chain = []
-
-                for path in batch:
-                    try:
-                        chain.append(Image.fromFileSystem(path))
-                    except Exception as e:
-                        logger.error(f"添加图片失败: {path} - {str(e)}")
-
-                if chain:
-                    yield event.chain_result(chain)
-                    await asyncio.sleep(0.5)
+    async def process_jm_download(self, event: AstrMessageEvent, album_id: str):
+        lock = self._get_album_lock(album_id)
+        if lock.locked():
+            yield event.plain_result("该作品正在处理中，请稍候...")
+        async with lock:
+            album_dir = download_root / album_id
+            yield event.plain_result(f"开始下载JM作品 {album_id}，请稍候...")
 
             try:
-                shutil.rmtree(base_path)
-                logger.info(f"已删除下载文件: {base_path}")
-            except Exception as e:
-                logger.error(f"删除文件失败: {str(e)}")
-
-        except Exception as e:
-            yield event.plain_result(f"发送图片时出错: {str(e)}")
-
-    async def send_pdf(self, event: AstrMessageEvent, jm_id: str):
-        try:
-            from astrbot.api.message_components import File
-            base_path = Path(get_astrbot_data_path()) / 'Download' / jm_id
-            
-            if not base_path.exists():
-                yield event.plain_result(f"本子不存在或者下载失败力")
-                return
-            
-            image_paths = sorted([
-                str(base_path / f) for f in os.listdir(base_path) 
-                if f.lower().endswith(('.png', '.jpg', '.jpeg'))
-            ])
-            
-            if not image_paths:
-                yield event.plain_result("下载失败力")
+                async for progress in self._download_with_progress(album_id):
+                    yield event.plain_result(progress)
+            except jmcomic.PartialDownloadFailedException:
+                logger.exception("作品 %s 部分章节下载失败", album_id)
+                if not album_dir.exists():
+                    yield event.plain_result("下载失败，请检查作品 ID 后重试。")
+                    return
+                yield event.plain_result("部分章节下载失败，将发送已下载内容。")
+            except Exception:
+                logger.exception("作品 %s 下载失败", album_id)
+                yield event.plain_result("下载失败，请稍后重试。")
                 return
 
-            pdf_password = jm_id
-            temp_pdf_path = base_path / f"{jm_id}_temp.pdf"
-            final_pdf_path = base_path / f"{jm_id}.pdf"
-            
             try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self._create_pdf_from_images(image_paths, str(temp_pdf_path))
-                )
-                
-                if pdf_password:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: self._add_password_to_pdf(str(temp_pdf_path), str(final_pdf_path), pdf_password)
-                    )
-                    os.remove(temp_pdf_path)
+                if self._is_pdf_mode():
+                    async for result in self.send_pdf(event, album_id):
+                        yield result
                 else:
-                    shutil.move(str(temp_pdf_path), str(final_pdf_path))
-                
-                file_name = f"{jm_id}.pdf"
-                file_path_str = str(final_pdf_path)
-                
-                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-                if isinstance(event, AiocqhttpMessageEvent):
-                    bot = event.bot
-                    if event.is_private_chat():
-                        await bot.api.call_action(
-                            "upload_private_file",
-                            user_id=int(event.get_sender_id()),
-                            file=file_path_str,
-                            name=file_name
-                        )
-                    else:
-                        await bot.api.call_action(
-                            "upload_group_file",
-                            group_id=int(event.get_group_id()),
-                            file=file_path_str,
-                            name=file_name
-                        )
-                    yield event.plain_result(f"PDF文件 {file_name} 已上传")
-                else:
-                    seg = File(name=file_name, file=file_path_str)
-                    yield event.chain_result([seg])
-                
-            finally:
-                async def delayed_cleanup():
-                    try:
-                        await asyncio.sleep(60)
-                        if final_pdf_path.exists():
-                            os.remove(final_pdf_path)
-                        if temp_pdf_path.exists():
-                            os.remove(temp_pdf_path)
-                        shutil.rmtree(base_path)
-                        logger.info(f"已清理PDF文件: {base_path}")
-                    except Exception as e:
-                        logger.error(f"清理PDF文件失败: {str(e)}")
+                    async for result in self.send_images(event, album_id):
+                        yield result
+            except Exception:
+                logger.exception("作品 %s 发送失败", album_id)
+                yield event.plain_result("发送失败，请稍后重试。")
 
-                task = asyncio.create_task(delayed_cleanup())
-                self._cleanup_tasks.add(task)
-                task.add_done_callback(self._cleanup_tasks.discard)
-                
-        except Exception as e:
-            yield event.plain_result(f"发送PDF时出错: {str(e)}")
+    async def _download_with_progress(self, album_id: str):
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str] = asyncio.Queue()
 
-    def _create_pdf_from_images(self, image_paths: list, output_path: str):
-        images = []
-        first_image = None
-
-        for i, path in enumerate(image_paths):
-            img = None
+        def emit(text: str):
             try:
-                img = Image.open(path)
-                img.verify()
-                img.close()
+                loop.call_soon_threadsafe(queue.put_nowait, text)
+            except RuntimeError:
+                pass
 
-                img = Image.open(path)
+        class ProgressDownloader(jmcomic.JmDownloader):
+            def before_album(self, album):
+                super().before_album(album)
+                emit(f"正在下载《{album.name}》，共 {len(album)} 章")
 
-                if img.mode == 'RGBA':
-                    img = img.convert('RGB')
-                elif img.mode != 'RGB':
-                    img = img.convert('RGB')
+            def after_photo(self, photo):
+                super().after_photo(photo)
+                total = len(photo.from_album)
+                if total > 1:
+                    emit(f"章节进度：{photo.album_index}/{total}")
 
-                if i == 0:
-                    first_image = img
-                else:
-                    images.append(img)
+        def download():
+            return option.download_album(
+                album_id,
+                downloader=ProgressDownloader,
+                check_exception=True,
+            )
 
-                logger.debug(f"成功处理图片: {path}")
-
-            except Exception as e:
-                if img is not None:
-                    try:
-                        img.close()
-                    except Exception:
-                        pass
-                logger.error(f"处理图片失败: {path} - {str(e)}")
-                continue
-
+        task = asyncio.create_task(asyncio.to_thread(download))
         try:
-            if first_image:
-                first_image.save(
-                    output_path,
-                    "PDF",
-                    resolution=100.0,
-                    save_all=True,
-                    append_images=images
-                )
-                logger.info(f"PDF创建成功: {output_path}, 共 {len(images) + 1} 页")
-            else:
-                raise ValueError("没有有效的图片可以生成PDF")
+            while True:
+                if task.done() and queue.empty():
+                    break
+                try:
+                    yield await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+            await task
+            while not queue.empty():
+                yield queue.get_nowait()
         finally:
-            if first_image is not None:
-                try:
-                    first_image.close()
-                except Exception:
-                    pass
-            for img in images:
-                try:
-                    img.close()
-                except Exception:
-                    pass
+            if not task.done():
+                task.cancel()
 
-    def _add_password_to_pdf(self, input_path: str, output_path: str, password: str):
+    def _collect_images(self, album_dir: Path) -> list[Path]:
+        if not album_dir.is_dir():
+            return []
+        files = [
+            path
+            for path in album_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        ]
+        files.sort(key=lambda path: _natural_key(path, album_dir))
+        return files
+
+    async def send_images(self, event: AstrMessageEvent, album_id: str):
+        album_dir = download_root / album_id
+        images = await asyncio.to_thread(self._collect_images, album_dir)
+        if not images:
+            await self._remove_dir(album_dir)
+            yield event.plain_result("没有找到可发送的图片，可能下载失败。")
+            return
+
+        max_images = self._cfg_int("max_images", 80, minimum=0)
+        truncated = max_images > 0 and len(images) > max_images
+        selected = images[:max_images] if truncated else images
+        if truncated:
+            yield event.plain_result(
+                f"作品共 {len(images)} 张图片，仅发送前 {max_images} 张。",
+            )
+
+        try:
+            if self._cfg_bool("use_forward", False):
+                nodes = [
+                    Node(content=[Image.fromFileSystem(str(path))], name=f"JM{album_id}", uin="0")
+                    for path in selected
+                ]
+                yield event.chain_result([Nodes(nodes)])
+            else:
+                batch_size = self._cfg_int("batch_size", 5, minimum=1)
+                interval = self._cfg_float("send_interval", 0.5)
+                for start in range(0, len(selected), batch_size):
+                    chain = []
+                    for path in selected[start:start + batch_size]:
+                        try:
+                            chain.append(Image.fromFileSystem(str(path)))
+                        except Exception:
+                            logger.exception("添加图片失败: %s", path)
+                    if chain:
+                        yield event.chain_result(chain)
+                        if interval > 0:
+                            await asyncio.sleep(interval)
+        except Exception:
+            logger.exception("作品 %s 图片发送失败", album_id)
+            yield event.plain_result("发送图片时出错，请稍后重试。")
+        finally:
+            await self._remove_dir(album_dir)
+
+    async def send_pdf(self, event: AstrMessageEvent, album_id: str):
+        album_dir = download_root / album_id
+        images = await asyncio.to_thread(self._collect_images, album_dir)
+        if not images:
+            await self._remove_dir(album_dir)
+            yield event.plain_result("没有找到可发送的图片，可能下载失败。")
+            return
+
+        max_images = self._cfg_int("max_images", 80, minimum=0)
+        truncated = max_images > 0 and len(images) > max_images
+        selected = images[:max_images] if truncated else images
+
+        temp_pdf = album_dir / f"{album_id}_temp.pdf"
+        final_pdf = album_dir / f"{album_id}.pdf"
+        password = self._pdf_password(album_id)
+
+        try:
+            if truncated:
+                yield event.plain_result(
+                    f"作品共 {len(images)} 张图片，PDF 仅包含前 {max_images} 张。",
+                )
+
+            await asyncio.to_thread(self._create_pdf, selected, temp_pdf)
+            encrypted = await asyncio.to_thread(
+                self._finalize_pdf, temp_pdf, final_pdf, password,
+            )
+
+            result = await self._build_file_result(event, final_pdf, f"{album_id}.pdf")
+            yield result
+            if password and encrypted:
+                yield event.plain_result(f"PDF 已发送，密码：{password}")
+            elif password:
+                yield event.plain_result("PDF 已发送（未加密：加密失败或 pypdf 未安装）。")
+            else:
+                yield event.plain_result("PDF 已发送。")
+        except Exception:
+            logger.exception("作品 %s PDF 发送失败", album_id)
+            yield event.plain_result("发送PDF时出错，请稍后重试。")
+        finally:
+            self._schedule_cleanup(album_dir)
+
+    async def _build_file_result(self, event: AstrMessageEvent, path: Path, name: str):
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
+
+        if isinstance(event, AiocqhttpMessageEvent):
+            try:
+                await self._upload_file_via_api(event, path, name)
+                return event.plain_result(f"已上传文件：{name}")
+            except Exception:
+                logger.exception("OneBot 文件接口上传失败，回退到 File 消息段")
+        return event.chain_result([File(name=name, file=str(path))])
+
+    async def _upload_file_via_api(self, event, path: Path, name: str):
+        if event.is_private_chat():
+            await event.bot.api.call_action(
+                "upload_private_file",
+                user_id=int(event.get_sender_id()),
+                file=str(path),
+                name=name,
+            )
+        else:
+            await event.bot.api.call_action(
+                "upload_group_file",
+                group_id=int(event.get_group_id()),
+                file=str(path),
+                name=name,
+            )
+
+    def _create_pdf(self, image_paths: list[Path], output_path: Path):
+        try:
+            import img2pdf
+
+            output_path.write_bytes(img2pdf.convert([str(p) for p in image_paths]))
+            logger.info("PDF 创建成功（img2pdf）: %s, 共 %d 页", output_path, len(image_paths))
+            return
+        except ImportError:
+            logger.warning("img2pdf 未安装，回退到 Pillow 生成 PDF")
+        except Exception:
+            logger.exception("img2pdf 生成失败，回退到 Pillow")
+
+        self._create_pdf_with_pillow(image_paths, output_path)
+
+    def _create_pdf_with_pillow(self, image_paths: list[Path], output_path: Path):
+        tmp_dir = Path(tempfile.mkdtemp(prefix="jm_pdf_", dir=str(output_path.parent)))
+        chunks: list[Path] = []
+        page_count = 0
+        try:
+            for start in range(0, len(image_paths), PDF_CHUNK_SIZE):
+                images = []
+                try:
+                    for path in image_paths[start:start + PDF_CHUNK_SIZE]:
+                        try:
+                            img = PILImage.open(path)
+                            if img.mode != "RGB":
+                                converted = img.convert("RGB")
+                                img.close()
+                                img = converted
+                            images.append(img)
+                        except Exception:
+                            logger.exception("处理图片失败: %s", path)
+                    if not images:
+                        continue
+                    chunk_path = tmp_dir / f"part_{start:05d}.pdf"
+                    images[0].save(
+                        chunk_path,
+                        "PDF",
+                        resolution=100.0,
+                        save_all=True,
+                        append_images=images[1:],
+                    )
+                    chunks.append(chunk_path)
+                    page_count += len(images)
+                finally:
+                    for img in images:
+                        with contextlib.suppress(Exception):
+                            img.close()
+
+            if not chunks:
+                raise ValueError("没有有效的图片可以生成PDF")
+
+            if len(chunks) == 1:
+                shutil.move(str(chunks[0]), str(output_path))
+            else:
+                from pypdf import PdfWriter
+
+                writer = PdfWriter()
+                try:
+                    for chunk in chunks:
+                        writer.append(str(chunk))
+                    with open(output_path, "wb") as output_file:
+                        writer.write(output_file)
+                finally:
+                    with contextlib.suppress(Exception):
+                        writer.close()
+            logger.info(
+                "PDF 创建成功（Pillow）: %s, 共 %d 页", output_path, page_count,
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _finalize_pdf(self, temp_pdf: Path, final_pdf: Path, password: str | None) -> bool:
+        if password:
+            if self._add_password_to_pdf(temp_pdf, final_pdf, password):
+                with contextlib.suppress(OSError):
+                    temp_pdf.unlink()
+                return True
+            if final_pdf.exists():
+                final_pdf.unlink()
+        shutil.move(str(temp_pdf), str(final_pdf))
+        return False
+
+    def _add_password_to_pdf(self, input_path: Path, output_path: Path, password: str) -> bool:
         try:
             from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            logger.warning("pypdf 未安装，PDF 将不加密")
+            shutil.copy(input_path, output_path)
+            return False
 
-            reader = PdfReader(input_path)
+        try:
+            reader = PdfReader(str(input_path))
             writer = PdfWriter()
-
             try:
                 for page in reader.pages:
                     writer.add_page(page)
-
                 writer.encrypt(password)
-
                 with open(output_path, "wb") as output_file:
                     writer.write(output_file)
-
-                logger.info(f"PDF加密成功: {output_path}")
             finally:
-                reader.close()
-                writer.close()
+                with contextlib.suppress(Exception):
+                    reader.close()
+                with contextlib.suppress(Exception):
+                    writer.close()
+            logger.info("PDF 加密成功: %s", output_path)
+            return True
+        except Exception:
+            logger.exception("PDF 加密失败，将发送未加密文件")
+            shutil.copy(input_path, output_path)
+            return False
 
-        except ImportError:
-            logger.warning("pypdf库未安装，跳过PDF加密，直接复制文件")
-            shutil.copy(input_path, output_path)
-        except Exception as e:
-            logger.error(f"PDF加密失败: {str(e)}")
-            shutil.copy(input_path, output_path)
+    def _schedule_cleanup(self, album_dir: Path):
+        delay = self._cfg_int("cleanup_delay", 60)
+
+        async def cleanup():
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self._remove_dir(album_dir)
+            except Exception:
+                logger.exception("清理下载目录失败: %s", album_dir)
+
+        task = asyncio.create_task(cleanup())
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+
+    @staticmethod
+    async def _remove_dir(path: Path):
+        def remove():
+            shutil.rmtree(path, ignore_errors=True)
+
+        try:
+            await asyncio.to_thread(remove)
+            logger.info("已清理下载文件: %s", path)
+        except Exception:
+            logger.exception("删除文件失败: %s", path)
