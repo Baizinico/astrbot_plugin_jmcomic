@@ -125,7 +125,6 @@ class JMComicDownloader(Star):
             yield event.plain_result("该作品正在处理中，请稍候...")
         async with lock:
             album_dir = download_root / album_id
-            yield event.plain_result(f"开始下载JM作品 {album_id}，请稍候...")
 
             try:
                 async for progress in self._download_with_progress(album_id):
@@ -278,7 +277,8 @@ class JMComicDownloader(Star):
             )
 
             result = await self._build_file_result(event, final_pdf, f"{album_id}.pdf")
-            yield result
+            if result is not None:
+                yield result
             if password and encrypted:
                 yield event.plain_result(f"PDF 已发送，密码：{password}")
             elif password:
@@ -299,7 +299,7 @@ class JMComicDownloader(Star):
         if isinstance(event, AiocqhttpMessageEvent):
             try:
                 await self._upload_file_via_api(event, path, name)
-                return event.plain_result(f"已上传文件：{name}")
+                return None
             except Exception:
                 logger.exception("OneBot 文件接口上传失败，回退到 File 消息段")
         return event.chain_result([File(name=name, file=str(path))])
