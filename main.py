@@ -117,7 +117,7 @@ def _fetch_album_detail(album_id: str):
     return option.build_jm_client().get_album_detail(album_id)
 
 
-@register("JMComic下载器", "Baizi", "JMComic下载插件", "1.4.2")
+@register("JMComic下载器", "Baizi", "JMComic下载插件", "1.4.3")
 class JMComicDownloader(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -315,22 +315,6 @@ class JMComicDownloader(Star):
                     emit(f"正在下载《{album.name}》，共 {total} 章，下载全部章节")
                 else:
                     emit(f"正在下载《{album.name}》，共 {total} 章，仅下载第 {chapter} 章")
-
-            def after_photo(self, photo):
-                super().after_photo(photo)
-                album = photo.from_album
-                total = len(album)
-                if total <= 1:
-                    return
-                position = next(
-                    (
-                        index
-                        for index, episode in enumerate(album.episode_list)
-                        if episode[0] == photo.photo_id
-                    ),
-                    photo.album_index - 1,
-                )
-                emit(f"章节进度：{position + 1}/{total}")
 
         def download():
             if album is None:
