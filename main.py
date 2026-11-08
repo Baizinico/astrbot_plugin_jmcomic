@@ -3,6 +3,7 @@ import contextlib
 import re
 import shutil
 import tempfile
+import time
 import weakref
 from pathlib import Path
 
@@ -42,7 +43,81 @@ def _normalize_album_id(raw: str) -> str | None:
     return album_id if album_id.isdigit() else None
 
 
-@register("JMComic下载器", "Baizi", "JMComic下载插件", "1.2.0")
+CHAPTER_ALL = "all"
+_CHAPTER_PATTERN = re.compile(r"^第?\s*(\d+)\s*[章话話集]?$")
+
+
+class ChapterNotFoundError(Exception):
+    pass
+
+
+def _parse_chapter_selection(raw: str) -> int | str | None:
+    text = (raw or "").strip().lower()
+    if text in {"all", "全部", "所有"}:
+        return CHAPTER_ALL
+    match = _CHAPTER_PATTERN.match(text)
+    if match is None:
+        return None
+    chapter = int(match.group(1))
+    return chapter if chapter > 0 else None
+
+
+def _chapter_not_found_message(album, chapter: int) -> str:
+    numbers = [str(int(item[1])) for item in album.episode_list]
+    available = "、".join(numbers[:20]) + ("…" if len(numbers) > 20 else "")
+    return f"该作品共 {len(album)} 章，没有第 {chapter} 章。可用章节：{available}。"
+
+
+def _select_album_photos(detail, chapter: int | str):
+    if chapter == CHAPTER_ALL:
+        return detail
+    for position, episode in enumerate(detail.episode_list):
+        if int(episode[1]) == chapter:
+            return [detail[position]]
+    if len(detail) == 1 and chapter == 1:
+        return detail
+    raise ChapterNotFoundError(_chapter_not_found_message(detail, chapter))
+
+
+CHAPTER_SELECT_TIMEOUT = 30
+
+
+class _PendingSelection:
+    __slots__ = ("album_id", "album", "expires_at")
+
+    def __init__(self, album_id: str, album):
+        self.album_id = album_id
+        self.album = album
+        self.expires_at = time.monotonic() + CHAPTER_SELECT_TIMEOUT
+
+
+_pending_selections: dict[tuple[str, str], _PendingSelection] = {}
+
+
+def _pending_key(event: AstrMessageEvent) -> tuple[str, str]:
+    return event.unified_msg_origin, event.get_sender_id()
+
+
+def _purge_expired_selections():
+    now = time.monotonic()
+    for key, state in list(_pending_selections.items()):
+        if state.expires_at <= now:
+            _pending_selections.pop(key, None)
+
+
+class PendingChapterFilter(filter.CustomFilter):
+    def filter(self, event, cfg) -> bool:
+        state = _pending_selections.get(_pending_key(event))
+        if state is None:
+            return False
+        return _parse_chapter_selection(event.message_str.strip()) is not None
+
+
+def _fetch_album_detail(album_id: str):
+    return option.build_jm_client().get_album_detail(album_id)
+
+
+@register("JMComic下载器", "Baizi", "JMComic下载插件", "1.4.1")
 class JMComicDownloader(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -61,6 +136,7 @@ class JMComicDownloader(Star):
         if self._cleanup_tasks:
             await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
             self._cleanup_tasks.clear()
+        _pending_selections.clear()
         logger.info("JMComic下载插件已卸载")
 
     def _cfg_bool(self, key: str, default: bool) -> bool:
@@ -106,9 +182,14 @@ class JMComicDownloader(Star):
             yield event.plain_result("只有管理员可以使用该命令。")
             return
 
+        _purge_expired_selections()
+
         parts = event.message_str.split()
         if len(parts) < 2:
-            yield event.plain_result("请提供JM作品ID或链接，例如：/jm 12345")
+            yield event.plain_result(
+                "请提供JM作品ID或链接，例如：/jm 12345\n"
+                "多章作品会提示回复章节数字；也可直接指定：/jm 12345 3 或 /jm 12345 all"
+            )
             return
 
         album_id = _normalize_album_id(parts[1])
@@ -116,10 +197,61 @@ class JMComicDownloader(Star):
             yield event.plain_result("作品 ID 不合法，请提供数字 ID、JM+数字 或作品链接。")
             return
 
-        async for result in self.process_jm_download(event, album_id):
+        _pending_selections.pop(_pending_key(event), None)
+
+        if len(parts) >= 3:
+            chapter = _parse_chapter_selection(parts[2])
+            if chapter is None:
+                yield event.plain_result(
+                    "章节参数不合法，请使用章节序号（如 /jm 12345 3）、第3章 或 all（下载全部章节）。"
+                )
+                return
+            async for result in self.process_jm_download(event, album_id, chapter):
+                yield result
+            return
+
+        try:
+            album = await asyncio.to_thread(_fetch_album_detail, album_id)
+        except Exception:
+            logger.exception("获取作品 %s 信息失败", album_id)
+            yield event.plain_result("获取作品信息失败，请稍后重试。")
+            return
+
+        if len(album) <= 1:
+            async for result in self.process_jm_download(event, album_id, 1, album):
+                yield result
+            return
+
+        _pending_selections[_pending_key(event)] = _PendingSelection(album_id, album)
+        yield event.plain_result(
+            f"《{album.name}》共 {len(album)} 章，"
+            f"请回复要下载章节的数字，如：15（{CHAPTER_SELECT_TIMEOUT}秒内有效）"
+        )
+
+    @filter.custom_filter(PendingChapterFilter)
+    async def handle_chapter_choice(self, event: AstrMessageEvent):
+        key = _pending_key(event)
+        state = _pending_selections.pop(key, None)
+        if state is None:
+            return
+        if time.monotonic() > state.expires_at:
+            yield event.plain_result("章节选择已超时，请重新使用 /jm <作品ID> 下载。")
+            return
+        chapter = _parse_chapter_selection(event.message_str.strip())
+        if chapter is None:
+            return
+        async for result in self.process_jm_download(
+            event, state.album_id, chapter, state.album,
+        ):
             yield result
 
-    async def process_jm_download(self, event: AstrMessageEvent, album_id: str):
+    async def process_jm_download(
+        self,
+        event: AstrMessageEvent,
+        album_id: str,
+        chapter: int | str = 1,
+        album=None,
+    ):
         lock = self._get_album_lock(album_id)
         if lock.locked():
             yield event.plain_result("该作品正在处理中，请稍候...")
@@ -127,8 +259,13 @@ class JMComicDownloader(Star):
             album_dir = download_root / album_id
 
             try:
-                async for progress in self._download_with_progress(album_id):
+                async for progress in self._download_with_progress(
+                    album_id, chapter, album,
+                ):
                     yield event.plain_result(progress)
+            except ChapterNotFoundError as exc:
+                yield event.plain_result(str(exc))
+                return
             except jmcomic.PartialDownloadFailedException:
                 logger.exception("作品 %s 部分章节下载失败", album_id)
                 if not album_dir.exists():
@@ -151,7 +288,9 @@ class JMComicDownloader(Star):
                 logger.exception("作品 %s 发送失败", album_id)
                 yield event.plain_result("发送失败，请稍后重试。")
 
-    async def _download_with_progress(self, album_id: str):
+    async def _download_with_progress(
+        self, album_id: str, chapter: int | str = 1, album=None,
+    ):
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[str] = asyncio.Queue()
 
@@ -163,31 +302,46 @@ class JMComicDownloader(Star):
 
         class ProgressDownloader(jmcomic.JmDownloader):
             def do_filter(self, detail):
-                # 多章作品仅下载第一章
-                if detail.is_album():
-                    return detail[0:1]
-                return super().do_filter(detail)
+                if not detail.is_album():
+                    return super().do_filter(detail)
+                return _select_album_photos(detail, chapter)
 
             def before_album(self, album):
                 super().before_album(album)
                 total = len(album)
-                if total > 1:
-                    emit(f"正在下载《{album.name}》，共 {total} 章，仅下载第 1 章")
-                else:
+                if total <= 1:
                     emit(f"正在下载《{album.name}》，共 {total} 章")
+                elif chapter == CHAPTER_ALL:
+                    emit(f"正在下载《{album.name}》，共 {total} 章，下载全部章节")
+                else:
+                    emit(f"正在下载《{album.name}》，共 {total} 章，仅下载第 {chapter} 章")
 
             def after_photo(self, photo):
                 super().after_photo(photo)
-                total = len(photo.from_album)
-                if total > 1:
-                    emit(f"章节进度：{photo.album_index}/{total}")
+                album = photo.from_album
+                total = len(album)
+                if total <= 1:
+                    return
+                position = next(
+                    (
+                        index
+                        for index, episode in enumerate(album.episode_list)
+                        if episode[0] == photo.photo_id
+                    ),
+                    photo.album_index - 1,
+                )
+                emit(f"章节进度：{position + 1}/{total}")
 
         def download():
-            return option.download_album(
-                album_id,
-                downloader=ProgressDownloader,
-                check_exception=True,
-            )
+            if album is None:
+                return option.download_album(
+                    album_id,
+                    downloader=ProgressDownloader,
+                    check_exception=True,
+                )
+            downloader = ProgressDownloader(option)
+            downloader.download_by_album_detail(album)
+            downloader.raise_if_has_exception()
 
         task = asyncio.create_task(asyncio.to_thread(download))
         try:
