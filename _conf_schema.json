@@ -11,9 +11,9 @@
     },
     "max_images": {
         "description": "单次最多发送图片数",
-        "hint": "超出数量的图片不会发送，0 表示不限制。增加该值会显著增加流量和耗时。",
+        "hint": "超出数量的图片不会发送，0 表示不限制（默认）。设置该值会限制流量和耗时。",
         "type": "int",
-        "default": 80
+        "default": 0
     },
     "batch_size": {
         "description": "图片分批大小",

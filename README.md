@@ -77,7 +77,7 @@ pip install -r requirements.txt
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `send_mode` | string | `image` | `image` 分批发送图片，`pdf` 合并为 PDF |
-| `max_images` | int | `80` | 单次最多发送的图片数，`0` 表示不限制 |
+| `max_images` | int | `0` | 单次最多发送的图片数，`0` 表示不限制（默认） |
 | `batch_size` | int | `5` | 图片模式每条消息的图片数量 |
 | `send_interval` | float | `0.5` | 图片模式每批消息的间隔（秒） |
 | `use_forward` | bool | `false` | 是否使用合并转发发送图片 |
@@ -104,7 +104,7 @@ pip install -r requirements.txt
 
 ## 版本信息
 
-- **版本**：v1.4.1
+- **版本**：v1.4.2
 - **作者**：Baizi
 
 ## 支持

@@ -117,7 +117,7 @@ def _fetch_album_detail(album_id: str):
     return option.build_jm_client().get_album_detail(album_id)
 
 
-@register("JMComic下载器", "Baizi", "JMComic下载插件", "1.4.1")
+@register("JMComic下载器", "Baizi", "JMComic下载插件", "1.4.2")
 class JMComicDownloader(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -378,7 +378,7 @@ class JMComicDownloader(Star):
             yield event.plain_result("没有找到可发送的图片，可能下载失败。")
             return
 
-        max_images = self._cfg_int("max_images", 80, minimum=0)
+        max_images = self._cfg_int("max_images", 0, minimum=0)
         truncated = max_images > 0 and len(images) > max_images
         selected = images[:max_images] if truncated else images
         if truncated:
@@ -421,7 +421,7 @@ class JMComicDownloader(Star):
             yield event.plain_result("没有找到可发送的图片，可能下载失败。")
             return
 
-        max_images = self._cfg_int("max_images", 80, minimum=0)
+        max_images = self._cfg_int("max_images", 0, minimum=0)
         truncated = max_images > 0 and len(images) > max_images
         selected = images[:max_images] if truncated else images
 
